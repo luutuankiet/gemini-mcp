@@ -1,30 +1,76 @@
-# `mcp-remote`
+# `@luutuankiet/gemini-mcp`
 
-Connect an MCP Client that only supports local (stdio) servers to a Remote MCP Server, with auth support:
+**Drop-in MCP proxy that makes any MCP server work with Gemini.**
 
-**Note: this is a working proof-of-concept** but should be considered **experimental**.
+Gemini implements a [strict subset of JSON Schema](https://ai.google.dev/gemini-api/docs/function-calling#function_declarations) (OpenAPI 3.0-flavored). When MCP servers use common JSON Schema patterns — `$ref`, `$defs`, `anyOf`, `additionalProperties`, `title`, `default` — Gemini either silently degrades parameters to `STRING` or returns hard `400` errors.
 
-## Why is this necessary?
+This proxy sits between your MCP client and any MCP server, transparently transforming tool schemas so Gemini can call them correctly.
 
-So far, the majority of MCP servers in the wild are installed locally, using the stdio transport. This has some benefits: both the client and the server can implicitly trust each other as the user has granted them both permission to run. Adding secrets like API keys can be done using environment variables and never leave your machine. And building on `npx` and `uvx` has allowed users to avoid explicit install steps, too.
+## The Problem
 
-But there's a reason most software that _could_ be moved to the web _did_ get moved to the web: it's so much easier to find and fix bugs & iterate on new features when you can push updates to all your users with a single deploy.
+```
+✕ Error discovering tools from awslabs.aws-api-mcp-server:
+  can't resolve reference #/$defs/ProgramInterpretationResponse from id #
+```
 
-With the latest MCP [Authorization specification](https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization), we now have a secure way of sharing our MCP servers with the world _without_ running code on user's laptops. Or at least, you would, if all the popular MCP _clients_ supported it yet. Most are stdio-only, and those that _do_ support HTTP+SSE don't yet support the OAuth flows required.
+```
+400 Bad Request: reference to undefined schema at properties.target_object.anyOf.1
+```
 
-That's where `mcp-remote` comes in. As soon as your chosen MCP client supports remote, authorized servers, you can remove it. Until that time, drop in this one liner and dress for the MCP clients you want!
+These failures affect **every Pydantic-based MCP server** (AWS, Snowflake, etc.) and many TypeScript servers (Notion, etc.). The root cause: Gemini's API doesn't support standard JSON Schema features that MCP servers use heavily.
 
-## Usage
+| Pattern | What Happens in Gemini | Affected Servers |
+|---------|----------------------|------------------|
+| `$ref` / `$defs` | Hard 400 error — "can't resolve reference" | All Python/Pydantic MCP servers |
+| `anyOf[T, null]` | Hard 400 — "undefined schema" | Pydantic `Optional[T]` fields |
+| `anyOf` with `$ref` inside | Double failure — unresolved ref + union | Snowflake, AWS |
+| `title`, `default` | Silent degradation or rejected | All Pydantic servers |
+| `additionalProperties` | Schema validation conflict | Notion, complex TS servers |
+| `allOf` / `oneOf` | Not supported in Gemini Schema | Servers using composition |
 
-All the most popular MCP clients (Claude Desktop, Cursor & Windsurf) use the following config format:
+**References:**
+- [gemini-cli #13270](https://github.com/google-gemini/gemini-cli/issues/13270) — aws-api-mcp-server `$defs` failure
+- [gemini-cli #13326](https://github.com/google-gemini/gemini-cli/issues/13326) — Snowflake `$ref` inside `anyOf`
+- [awslabs/mcp #2442](https://github.com/awslabs/mcp/issues/2442) — cost-explorer nested model failure
+- [gemini-cli #11020](https://github.com/google-gemini/gemini-cli/issues/11020) — Notion `additionalProperties` composition bug
+
+## How It Works
+
+`gemini-mcp` wraps any MCP server (stdio, SSE, or HTTP) and intercepts `tools/list` responses. Before returning tool schemas to the client, it applies a 7-phase transformation pipeline:
+
+```
+MCP Client ←→ gemini-mcp ←→ Any MCP Server
+                  ↕
+         Schema Transform
+         (tools/list only)
+```
+
+| Phase | Transform | Why |
+|-------|-----------|-----|
+| 1 | Dereference `$ref` → inline definitions | Gemini can't resolve `$ref`, degrades to STRING |
+| 2 | Remove `$defs` / `definitions` | Cleanup after Phase 1 |
+| 3 | `anyOf[T, null]` → `{type: T, nullable: true}` | Gemini doesn't understand null unions |
+| 3b | `oneOf` → `anyOf`, `allOf` → merge | Gemini only supports `anyOf` |
+| 4 | `const` → `enum` | Not in Gemini Schema spec |
+| 5 | `exclusiveMinimum/Maximum` → `minimum/maximum` | Not in Gemini Schema spec |
+| 6 | Strip forbidden keys (`title`, `default`, `additionalProperties`, etc.) | Cause silent degradation or 400s |
+| 7 | Remove `if`/`then`/`else` conditionals | Not supported |
+
+All transforms are **lossless for tool calling** — they only affect schema metadata, not the actual parameter values passed to tools.
+
+## Quick Start
+
+### With Claude Desktop / Cursor / Windsurf
+
+Replace `mcp-remote` (or any stdio-based wrapper) with `gemini-mcp`:
 
 ```json
 {
   "mcpServers": {
-    "remote-example": {
+    "my-server": {
       "command": "npx",
       "args": [
-        "mcp-remote",
+        "@luutuankiet/gemini-mcp",
         "https://remote.mcp.server/sse"
       ]
     }
@@ -32,369 +78,96 @@ All the most popular MCP clients (Claude Desktop, Cursor & Windsurf) use the fol
 }
 ```
 
-### Custom Headers
+### With a local stdio server
 
-To bypass authentication, or to emit custom headers on all requests to your remote server, pass `--header` CLI arguments:
+Wrap any existing stdio MCP server:
 
 ```json
 {
   "mcpServers": {
-    "remote-example": {
+    "aws-api": {
       "command": "npx",
       "args": [
-        "mcp-remote",
-        "https://remote.mcp.server/sse",
-        "--header",
-        "Authorization: Bearer ${AUTH_TOKEN}"
+        "@luutuankiet/gemini-mcp",
+        "uvx",
+        "awslabs.aws-api-mcp-server@latest"
       ],
       "env": {
-        "AUTH_TOKEN": "..."
-      }
-    },
-  }
-}
-```
-
-**Note:** Cursor and Claude Desktop (Windows) have a bug where spaces inside `args` aren't escaped when it invokes `npx`, which ends up mangling these values. You can work around it using:
-
-```jsonc
-{
-  // rest of config...
-  "args": [
-    "mcp-remote",
-    "https://remote.mcp.server/sse",
-    "--header",
-    "Authorization:${AUTH_HEADER}" // note no spaces around ':'
-  ],
-  "env": {
-    "AUTH_HEADER": "Bearer <auth-token>" // spaces OK in env vars
-  }
-},
-```
-
-### Multiple Instances
-
-To run multiple instances of the same remote server with different configurations (e.g., different Atlassian tenants), use the `--resource` flag to isolate OAuth sessions:
-
-```json
-{
-  "mcpServers": {
-    "atlassian_tenant1": {
-      "command": "npx",
-      "args": [
-        "mcp-remote",
-        "https://mcp.atlassian.com/v1/sse",
-        "--resource",
-        "https://tenant1.atlassian.net/"
-      ]
-    },
-    "atlassian_tenant2": {
-      "command": "npx",
-      "args": [
-        "mcp-remote",
-        "https://mcp.atlassian.com/v1/sse",
-        "--resource",
-        "https://tenant2.atlassian.net/"
-      ]
-    }
-  }
-}
-```
-
-Each unique combination of server URL, resource, and custom headers will maintain separate OAuth sessions and token storage.
-
-### Flags
-
-* If `npx` is producing errors, consider adding `-y` as the first argument to auto-accept the installation of the `mcp-remote` package.
-
-```json
-      "command": "npx",
-      "args": [
-        "-y",
-        "mcp-remote",
-        "https://remote.mcp.server/sse"
-      ]
-```
-
-* To force `npx` to always check for an updated version of `mcp-remote`, add the `@latest` flag:
-
-```json
-      "args": [
-        "mcp-remote@latest",
-        "https://remote.mcp.server/sse"
-      ]
-```
-
-* To change which port `mcp-remote` listens for an OAuth redirect (by default `3334`), add an additional argument after the server URL. Note that whatever port you specify, if it is unavailable an open port will be chosen at random.
-
-```json
-      "args": [
-        "mcp-remote",
-        "https://remote.mcp.server/sse",
-        "9696"
-      ]
-```
-
-* To change which host `mcp-remote` registers as the OAuth callback URL (by default `localhost`), add the `--host` flag.
-
-```json
-      "args": [
-        "mcp-remote",
-        "https://remote.mcp.server/sse",
-        "--host",
-        "127.0.0.1"
-      ]
-```
-
-* To allow HTTP connections in trusted private networks, add the `--allow-http` flag. Note: This should only be used in secure private networks where traffic cannot be intercepted.
-
-```json
-      "args": [
-        "mcp-remote",
-        "http://internal-service.vpc/sse",
-        "--allow-http"
-      ]
-```
-
-* To enable detailed debugging logs, add the `--debug` flag. This will write verbose logs to `~/.mcp-auth/{server_hash}_debug.log` with timestamps and detailed information about the auth process, connections, and token refreshing.
-
-```json
-      "args": [
-        "mcp-remote",
-        "https://remote.mcp.server/sse",
-        "--debug"
-      ]
-```
-
-* To suppress default logs, add the `--silent` flag. This will prevent logs from being emitted, except in the case where `--debug` is also passed.
-
-```json
-      "args": [
-        "mcp-remote",
-        "https://remote.mcp.server/sse",
-        "--silent"
-      ]
-```
-
-* To enable an outbound HTTP(S) proxy for mcp-remote, add the `--enable-proxy` flag. When enabled, mcp-remote will use the proxy settings from common environment variables (for example `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`).
-
-```json
-    "args": [
-      "mcp-remote",
-      "https://remote.mcp.server/sse",
-      "--enable-proxy"
-    ],
-    "env": {
-      "HTTPS_PROXY": "http://127.0.0.1:3128",
-      "NO_PROXY": "localhost,127.0.0.1"
-    }
-```
-
-* To ignore specific tools from the remote server, add the `--ignore-tool` flag. This will filter out tools matching the specified patterns from both `tools/list` responses and block `tools/call` requests. Supports wildcard patterns with `*`.
-
-```json
-      "args": [
-        "mcp-remote",
-        "https://remote.mcp.server/sse",
-        "--ignore-tool",
-        "delete*",
-        "--ignore-tool",
-        "remove*"
-      ]
-```
-
-You can specify multiple `--ignore-tool` flags to ignore different patterns. Examples:
-- `delete*` - ignores all tools starting with "delete" (e.g., `deleteTask`, `deleteUser`)
-- `*account` - ignores all tools ending with "account" (e.g., `getAccount`, `updateAccount`)
-- `exactTool` - ignores only the tool named exactly "exactTool"
-
-* To change the timeout for the OAuth callback (by default `30` seconds), add the `--auth-timeout` flag with a value in seconds. This is useful if the authentication process on the server side takes a long time.
-
-```json
-      "args": [
-        "mcp-remote",
-        "https://remote.mcp.server/sse",
-        "--auth-timeout",
-        "60"
-      ]
-```
-
-### Transport Strategies
-
-MCP Remote supports different transport strategies when connecting to an MCP server. This allows you to control whether it uses Server-Sent Events (SSE) or HTTP transport, and in what order it tries them.
-
-Specify the transport strategy with the `--transport` flag:
-
-```bash
-npx mcp-remote https://example.remote/server --transport sse-only
-```
-
-**Available Strategies:**
-
-- `http-first` (default): Tries HTTP transport first, falls back to SSE if HTTP fails with a 404 error
-- `sse-first`: Tries SSE transport first, falls back to HTTP if SSE fails with a 405 error
-- `http-only`: Only uses HTTP transport, fails if the server doesn't support it
-- `sse-only`: Only uses SSE transport, fails if the server doesn't support it
-
-### Static OAuth Client Metadata
-
-MCP Remote supports providing static OAuth client metadata instead of using the mcp-remote defaults.
-This is useful when connecting to OAuth servers that expect specific client/software IDs or scopes.
-
-Provide the client metadata as a JSON string or as a `@` prefixed filepath with the `--static-oauth-client-metadata` flag:
-
-```bash
-npx mcp-remote https://example.remote/server --static-oauth-client-metadata '{ "scope": "space separated scopes" }'
-# uses node readfile, so you probably want to use absolute paths if you're not sure what the cwd is
-npx mcp-remote https://example.remote/server --static-oauth-client-metadata '@/Users/username/Library/Application Support/Claude/oauth_client_metadata.json'
-```
-
-### Static OAuth Client Information
-
-Per the [spec](https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization#2-4-dynamic-client-registration),
-servers are encouraged but not required to support [OAuth dynamic client registration](https://datatracker.ietf.org/doc/html/rfc7591).
-
-For these servers, MCP Remote supports providing static OAuth client information instead.
-This is useful when connecting to OAuth servers that require pre-registered clients.
-
-Provide the client metadata as a JSON string or as a `@` prefixed filepath with the `--static-oauth-client-info` flag:
-
-```bash
-export MCP_REMOTE_CLIENT_ID=xxx
-export MCP_REMOTE_CLIENT_SECRET=yyy
-npx mcp-remote https://example.remote/server --static-oauth-client-info "{ \"client_id\": \"$MCP_REMOTE_CLIENT_ID\", \"client_secret\": \"$MCP_REMOTE_CLIENT_SECRET\" }"
-# uses node readfile, so you probably want to use absolute paths if you're not sure what the cwd is
-npx mcp-remote https://example.remote/server --static-oauth-client-info '@/Users/username/Library/Application Support/Claude/oauth_client_info.json'
-```
-
-### Claude Desktop
-
-[Official Docs](https://modelcontextprotocol.io/quickstart/user)
-
-In order to add an MCP server to Claude Desktop you need to edit the configuration file located at:
-
-* macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-* Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-
-If it does not exist yet, [you may need to enable it under Settings > Developer](https://modelcontextprotocol.io/quickstart/user#2-add-the-filesystem-mcp-server).
-
-Restart Claude Desktop to pick up the changes in the configuration file.
-Upon restarting, you should see a hammer icon in the bottom right corner
-of the input box.
-
-### Cursor
-
-[Official Docs](https://docs.cursor.com/context/model-context-protocol). The configuration file is located at `~/.cursor/mcp.json`.
-
-As of version `0.48.0`, Cursor supports unauthed SSE servers directly. If your MCP server is using the official MCP OAuth authorization protocol, you still need to add a **"command"** server and call `mcp-remote`.
-
-### Windsurf
-
-[Official Docs](https://docs.codeium.com/windsurf/mcp). The configuration file is located at `~/.codeium/windsurf/mcp_config.json`.
-
-## Building Remote MCP Servers
-
-For instructions on building & deploying remote MCP servers, including acting as a valid OAuth client, see the following resources:
-
-* https://developers.cloudflare.com/agents/guides/remote-mcp-server/
-
-In particular, see:
-
-* https://github.com/cloudflare/workers-oauth-provider for defining an MCP-comlpiant OAuth server in Cloudflare Workers
-* https://github.com/cloudflare/agents/tree/main/examples/mcp for defining an `McpAgent` using the [`agents`](https://npmjs.com/package/agents) framework.
-
-For more information about testing these servers, see also:
-
-* https://developers.cloudflare.com/agents/guides/test-remote-mcp-server/
-
-Know of more resources you'd like to share? Please add them to this Readme and send a PR!
-
-## Troubleshooting
-
-### Clear your `~/.mcp-auth` directory
-
-`mcp-remote` stores all the credential information inside `~/.mcp-auth` (or wherever your `MCP_REMOTE_CONFIG_DIR` points to). If you're having persistent issues, try running:
-
-```sh
-rm -rf ~/.mcp-auth
-```
-
-Then restarting your MCP client.
-
-### Check your Node version
-
-Make sure that the version of Node you have installed is [18 or
-higher](https://modelcontextprotocol.io/quickstart/server). Claude
-Desktop will use your system version of Node, even if you have a newer
-version installed elsewhere.
-
-### Restart Claude
-
-When modifying `claude_desktop_config.json` it can helpful to completely restart Claude
-
-### VPN Certs
-
-You may run into issues if you are behind a VPN, you can try setting the `NODE_EXTRA_CA_CERTS`
-environment variable to point to the CA certificate file. If using `claude_desktop_config.json`,
-this might look like:
-
-```json
-{
- "mcpServers": {
-    "remote-example": {
-      "command": "npx",
-      "args": [
-        "mcp-remote",
-        "https://remote.mcp.server/sse"
-      ],
-      "env": {
-        "NODE_EXTRA_CA_CERTS": "{your CA certificate file path}.pem"
+        "AWS_REGION": "us-east-1"
       }
     }
   }
 }
 ```
 
-### Check the logs
-
-* [Follow Claude Desktop logs in real-time](https://modelcontextprotocol.io/docs/tools/debugging#debugging-in-claude-desktop)
-* MacOS / Linux:<br/>`tail -n 20 -F ~/Library/Logs/Claude/mcp*.log`
-* For bash on WSL:<br/>`tail -n 20 -f "C:\Users\YourUsername\AppData\Local\Claude\Logs\mcp.log"`
-* Powershell: <br/>`Get-Content "C:\Users\YourUsername\AppData\Local\Claude\Logs\mcp.log" -Wait -Tail 20`
-
-## Debugging
-
-### Debug Logs
-
-For troubleshooting complex issues, especially with token refreshing or authentication problems, use the `--debug` flag:
+### Gemini CLI
 
 ```json
-"args": [
-  "mcp-remote",
-  "https://remote.mcp.server/sse",
-  "--debug"
-]
+{
+  "mcpServers": {
+    "notion": {
+      "command": "npx",
+      "args": [
+        "@luutuankiet/gemini-mcp",
+        "npx",
+        "@notionhq/notion-mcp-server"
+      ],
+      "env": {
+        "NOTION_API_TOKEN": "..."
+      }
+    }
+  }
+}
 ```
 
-This creates detailed logs in `~/.mcp-auth/{server_hash}_debug.log` with timestamps and complete information about every step of the connection and authentication process. When you find issues with token refreshing, laptop sleep/resume issues, or auth problems, provide these logs when seeking support.
+## CLI Flags
 
-### Authentication Errors
+All `mcp-remote` flags are supported (this package is a superset of `mcp-remote`):
 
-If you encounter the following error, returned by the `/callback` URL:
+| Flag | Description |
+|------|-------------|
+| `--header "Key: Value"` | Custom headers for remote servers |
+| `--transport <strategy>` | `http-first` (default), `sse-first`, `http-only`, `sse-only` |
+| `--allow-http` | Allow HTTP (non-TLS) connections |
+| `--debug` | Write debug logs to `~/.mcp-auth/{hash}_debug.log` |
+| `--silent` | Suppress default logs |
+| `--ignore-tool <pattern>` | Filter tools by name (supports wildcards) |
+| `--resource <url>` | Isolate OAuth sessions for multi-tenant setups |
+| `--host <hostname>` | OAuth callback host (default: `localhost`) |
+| `--auth-timeout <seconds>` | OAuth callback timeout (default: `30`) |
+| `--enable-proxy` | Use `HTTP_PROXY`/`HTTPS_PROXY` env vars |
+| `--static-oauth-client-metadata <json\|@file>` | Custom OAuth client metadata |
+| `--static-oauth-client-info <json\|@file>` | Pre-registered OAuth client info |
+
+## Testing
+
+```bash
+# Unit tests (134 tests covering all transform phases)
+pnpm test:unit
+
+# E2E tests (requires network — tests against real MCP servers)
+cd test && pnpm install && pnpm test
+```
+
+## Architecture
 
 ```
-Authentication Error
-Token exchange failed: HTTP 400
+src/
+├── proxy.ts              # CLI entrypoint — stdio ↔ remote proxy
+├── client.ts             # Debug client mode
+└── lib/
+    ├── transforms.ts     # 🔑 Gemini schema transform pipeline (7 phases)
+    ├── transforms.test.ts # 134 unit tests for transforms
+    ├── utils.ts          # Transport, proxy logic, mcpProxy()
+    ├── coordination.ts   # OAuth lazy auth coordinator
+    ├── node-oauth-client-provider.ts  # OAuth client implementation
+    └── types.ts          # Shared types
 ```
 
-You can run `rm -rf ~/.mcp-auth` to clear any locally stored state and tokens.
+## Credits
 
-### "Client" mode
+Built on top of [`mcp-remote`](https://github.com/geelen/mcp-remote) by Glen Maddern. The proxy infrastructure (stdio ↔ SSE/HTTP bridge, OAuth flows) comes from `mcp-remote` — this package adds the Gemini schema compatibility layer.
 
-Run the following on the command line (not from an MCP server):
+## License
 
-```shell
-npx -p mcp-remote@latest mcp-remote-client https://remote.mcp.server/sse
-```
-
-This will run through the entire authorization flow and attempt to list the tools & resources at the remote URL. Try this after running `rm -rf ~/.mcp-auth` to see if stale credentials are your problem, otherwise hopefully the issue will be more obvious in these logs than those in your MCP client.
+MIT

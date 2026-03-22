@@ -1,14 +1,65 @@
-name: Publish Any Commit
+name: Publish to npm
+
 on:
-  pull_request:
   push:
-    branches:
-      - '**'
     tags:
-      - '!**'
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
-  build:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm & install
+        uses: wyvox/action-setup-pnpm@v3
+        with:
+          node-version: 22
+
+      - name: Run type checking
+        run: pnpm run check
+
+      - name: Run unit tests
+        run: pnpm run test:unit
+
+      - name: Build
+        run: pnpm build
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm & install
+        uses: wyvox/action-setup-pnpm@v3
+        with:
+          node-version: 22
+
+      - name: Build
+        run: pnpm build
+
+      - name: Set version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version
+
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  preview:
+    name: Preview (pkg-pr-new)
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
 
     steps:
