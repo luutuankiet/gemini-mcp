@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 
 /**
- * MCP Proxy with OAuth support
- * A bidirectional proxy between a local STDIO MCP server and a remote SSE server with OAuth authentication.
+ * MCP Proxy with Gemini schema transforms
  *
- * Run with: npx tsx proxy.ts https://example.remote/server [callback-port]
+ * Two modes:
+ *   Remote: npx gemini-mcp https://example.remote/server [callback-port]
+ *   Stdio:  npx gemini-mcp <command> [args...]
  *
- * If callback-port is not specified, an available port will be automatically selected.
+ * In remote mode, proxies between local stdio and a remote SSE/HTTP server with OAuth.
+ * In stdio mode, spawns a local MCP server as a child process and proxies stdio↔stdio.
+ * Both modes intercept tools/list and transform schemas for Gemini compatibility.
  */
 
 import { EventEmitter } from 'events'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import {
   connectToRemoteServer,
   log,
@@ -164,39 +168,132 @@ to the CA certificate file. If using claude_desktop_config.json, this might look
   }
 }
 
-// Parse command-line arguments and run the proxy
-parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://server-url> [callback-port] [--debug]')
-  .then(
-    ({
-      serverUrl,
-      callbackPort,
-      headers,
-      transportStrategy,
-      host,
-      debug,
-      staticOAuthClientMetadata,
-      staticOAuthClientInfo,
-      authorizeResource,
-      ignoredTools,
-      authTimeoutMs,
-      serverUrlHash,
-    }) => {
-      return runProxy(
+/**
+ * Stdio-to-stdio proxy mode.
+ * Spawns a local MCP server as a child process and proxies between
+ * the client's stdio and the child's stdio, with Gemini transforms applied.
+ */
+async function runStdioProxy(command: string, commandArgs: string[], ignoredTools: string[]) {
+  // Client-facing side: we ARE the MCP server to the caller
+  const localTransport = new StdioServerTransport()
+
+  // Upstream side: spawn the real MCP server as a child process
+  const remoteTransport = new StdioClientTransport({
+    command,
+    args: commandArgs,
+    env: process.env as Record<string, string>,
+  })
+
+  // Wire them together — Gemini transforms happen inside mcpProxy on tools/list
+  mcpProxy({
+    transportToClient: localTransport,
+    transportToServer: remoteTransport,
+    ignoredTools,
+  })
+
+  // Start both transports
+  await remoteTransport.start()
+  await localTransport.start()
+
+  log(`Stdio proxy running: ${command} ${commandArgs.join(' ')}`)
+  log('Gemini schema transforms active on tools/list responses')
+
+  // Cleanup on exit
+  const cleanup = async () => {
+    await remoteTransport.close()
+    await localTransport.close()
+  }
+  setupSignalHandlers(cleanup)
+}
+
+/**
+ * Detect whether the first arg is a URL or a command.
+ * If it parses as a URL with http(s) protocol, it's remote mode.
+ * Otherwise, it's a command to spawn in stdio mode.
+ */
+function isUrl(arg: string): boolean {
+  try {
+    const url = new URL(arg)
+    return url.protocol === 'https:' || url.protocol === 'http:'
+  } catch {
+    return false
+  }
+}
+
+// Parse command-line arguments and run the appropriate mode
+const args = process.argv.slice(2)
+
+if (args.length === 0) {
+  log('Usage:')
+  log('  Remote: npx gemini-mcp <https://server-url> [callback-port] [--debug]')
+  log('  Stdio:  npx gemini-mcp <command> [args...] [--debug]')
+  process.exit(1)
+}
+
+if (isUrl(args[0])) {
+  // Remote mode — parse all flags and connect to remote server
+  parseCommandLineArgs(args, 'Usage: npx gemini-mcp <https://server-url> [callback-port] [--debug]')
+    .then(
+      ({
         serverUrl,
         callbackPort,
         headers,
         transportStrategy,
         host,
+        debug,
         staticOAuthClientMetadata,
         staticOAuthClientInfo,
         authorizeResource,
         ignoredTools,
         authTimeoutMs,
         serverUrlHash,
-      )
-    },
-  )
-  .catch((error) => {
+      }) => {
+        return runProxy(
+          serverUrl,
+          callbackPort,
+          headers,
+          transportStrategy,
+          host,
+          staticOAuthClientMetadata,
+          staticOAuthClientInfo,
+          authorizeResource,
+          ignoredTools,
+          authTimeoutMs,
+          serverUrlHash,
+        )
+      },
+    )
+    .catch((error) => {
+      log('Fatal error:', error)
+      process.exit(1)
+    })
+} else {
+  // Stdio mode — first arg is a command, rest are its arguments
+  // Extract gemini-mcp-specific flags before passing remaining args to the child
+  const command = args[0]
+  const childArgs: string[] = []
+  const ignoredTools: string[] = []
+
+  let i = 1
+  while (i < args.length) {
+    if (args[i] === '--ignore-tool' && i < args.length - 1) {
+      ignoredTools.push(args[i + 1])
+      log(`Ignoring tool: ${args[i + 1]}`)
+      i += 2
+      continue
+    }
+    if (args[i] === '--debug') {
+      // Enable debug mode but don't pass to child
+      i++
+      continue
+    }
+    // Everything else is passed to the child command
+    childArgs.push(args[i])
+    i++
+  }
+
+  runStdioProxy(command, childArgs, ignoredTools).catch((error) => {
     log('Fatal error:', error)
     process.exit(1)
   })
+}

@@ -258,3 +258,60 @@ describe('Real Server: awslabs.aws-api-mcp-server', () => {
     180_000,
   )
 })
+
+// ============== Stdio Proxy Wrapping Tests ==============
+// These test the full pipeline: client → proxy (stdio mode) → upstream server
+
+import { fileURLToPath } from 'url'
+import { dirname, resolve } from 'path'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = dirname(__filename)
+const PROXY_PATH = resolve(__dirname, '../dist/proxy.js')
+
+describe('Stdio Proxy: client → gemini-mcp → upstream server', () => {
+  let conn: ServerConnection | null = null
+
+  afterEach(async () => {
+    if (conn) {
+      await conn.cleanup()
+      conn = null
+    }
+  })
+
+  it('Notion schemas are Gemini-compatible through stdio proxy', async () => {
+    // Client connects to our proxy, which spawns Notion as a child process
+    conn = await connectToServer('node', [PROXY_PATH, 'npx', '-y', '@notionhq/notion-mcp-server'])
+    const tools = await getTools(conn.client)
+
+    expect(tools.length).toBeGreaterThan(0)
+    console.log(`  📡 Notion via proxy: ${tools.length} tools discovered`)
+
+    // All schemas should already be transformed — no violations
+    for (const tool of tools) {
+      assertGeminiCompatible(tool.name, tool.inputSchema)
+    }
+
+    console.log(`  ✅ All ${tools.length} Notion schemas are Gemini-compatible through stdio proxy`)
+  }, 120_000)
+
+  it.skipIf(!isCommandAvailable('uvx'))(
+    'AWS API schemas are Gemini-compatible through stdio proxy',
+    async () => {
+      conn = await connectToServer('node', [PROXY_PATH, 'uvx', 'awslabs.aws-api-mcp-server@latest'], {
+        AWS_REGION: 'us-east-1',
+      })
+      const tools = await getTools(conn.client)
+
+      expect(tools.length).toBeGreaterThan(0)
+      console.log(`  📡 AWS API via proxy: ${tools.length} tools discovered`)
+
+      for (const tool of tools) {
+        assertGeminiCompatible(tool.name, tool.inputSchema)
+      }
+
+      console.log(`  ✅ All ${tools.length} AWS API schemas are Gemini-compatible through stdio proxy`)
+    },
+    180_000,
+  )
+})
