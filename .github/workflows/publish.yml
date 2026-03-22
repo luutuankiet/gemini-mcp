@@ -40,11 +40,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup pnpm & install
-        uses: wyvox/action-setup-pnpm@v3
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: 22
-          node-registry-url: 'https://registry.npmjs.org'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Update npm for trusted publishing
+        run: npm install -g npm@latest
 
       - name: Build
         run: pnpm build
@@ -54,7 +63,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           npm version "$VERSION" --no-git-tag-version
 
-      - name: Publish to npm (OIDC provenance)
+      - name: Publish to npm (OIDC trusted publisher)
         run: npm publish --access public --provenance
 
   preview:

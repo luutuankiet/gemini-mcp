@@ -41,6 +41,7 @@
     "build:watch": "tsup --watch",
     "check": "prettier --check . && tsc",
     "lint-fix": "prettier --check . --write",
+    "prepublishOnly": "pnpm build",
     "test:unit": "vitest run",
     "test:unit:watch": "vitest"
   },
