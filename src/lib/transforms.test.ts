@@ -535,10 +535,7 @@ describe('Comprehensive: All patterns combined', () => {
         bounded: { type: 'integer', exclusiveMinimum: 0, exclusiveMaximum: 100 },
         union: { oneOf: [{ type: 'string' }, { type: 'integer' }] },
         merged: {
-          allOf: [
-            { type: 'object', properties: { x: { type: 'string' } } },
-            { properties: { y: { type: 'integer' } } },
-          ],
+          allOf: [{ type: 'object', properties: { x: { type: 'string' } } }, { properties: { y: { type: 'integer' } } }],
         },
       },
       $defs: {
