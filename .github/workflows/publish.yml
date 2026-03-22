@@ -69,7 +69,7 @@ jobs:
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           fi
       - name: Publish to npm (OIDC provenance)
-        run: pnpm publish --access public --provenance --tag ${{ steps.dist-tag.outputs.tag }}
+        run: pnpm publish --access public --provenance --no-git-checks --tag ${{ steps.dist-tag.outputs.tag }}
 
   preview:
     name: Preview (pkg-pr-new)
