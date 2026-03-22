@@ -25,6 +25,12 @@
     "LICENSE"
   ],
   "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
   "bin": {
     "gemini-mcp": "dist/proxy.js",
     "mcp-remote": "dist/proxy.js",
@@ -57,6 +63,7 @@
   },
   "tsup": {
     "entry": [
+      "src/index.ts",
       "src/client.ts",
       "src/proxy.ts"
     ],
