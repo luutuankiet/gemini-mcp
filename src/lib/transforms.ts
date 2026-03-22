@@ -212,9 +212,7 @@ function handleUnionTypes(schema: Record<string, any>): Record<string, any> {
         }
         Object.assign(result, merged)
       } else if (key === 'properties' && typeof value === 'object' && value !== null) {
-        result.properties = Object.fromEntries(
-          Object.entries(value).map(([k, v]) => [k, processNode(v)]),
-        )
+        result.properties = Object.fromEntries(Object.entries(value).map(([k, v]) => [k, processNode(v)]))
       } else if (key === 'items' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
         result.items = processNode(value)
       } else if (typeof value === 'object' && value !== null && !Array.isArray(value)) {

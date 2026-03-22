@@ -29,7 +29,7 @@ import { ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js'
 import { execSync } from 'child_process'
 
 // Import from the built dist (test/ is a separate package — parent must be built first)
-const { makeGeminiCompatible } = await import('../dist/index.js') as {
+const { makeGeminiCompatible } = (await import('../dist/index.js')) as {
   makeGeminiCompatible: (schema: Record<string, any>) => Record<string, any>
 }
 
@@ -71,10 +71,7 @@ const GEMINI_FORBIDDEN = new Set([
  * Recursively find all Gemini-forbidden keys in a schema.
  * Returns an array of {path, key} violations.
  */
-function findForbiddenKeys(
-  schema: any,
-  path = 'root',
-): Array<{ path: string; key: string }> {
+function findForbiddenKeys(schema: any, path = 'root'): Array<{ path: string; key: string }> {
   const violations: Array<{ path: string; key: string }> = []
   if (!schema || typeof schema !== 'object') return violations
 
@@ -106,13 +103,8 @@ function assertGeminiCompatible(toolName: string, schema: any) {
       .slice(0, 10)
       .map((v) => `  ${v.path} → "${v.key}"`)
       .join('\n')
-    const more =
-      violations.length > 10
-        ? `\n  ... and ${violations.length - 10} more`
-        : ''
-    throw new Error(
-      `Tool "${toolName}" has ${violations.length} Gemini-incompatible key(s):\n${details}${more}`,
-    )
+    const more = violations.length > 10 ? `\n  ... and ${violations.length - 10} more` : ''
+    throw new Error(`Tool "${toolName}" has ${violations.length} Gemini-incompatible key(s):\n${details}${more}`)
   }
 }
 
@@ -126,21 +118,14 @@ interface ServerConnection {
 /**
  * Connect directly to a local stdio MCP server.
  */
-async function connectToServer(
-  command: string,
-  args: string[],
-  env: Record<string, string> = {},
-): Promise<ServerConnection> {
+async function connectToServer(command: string, args: string[], env: Record<string, string> = {}): Promise<ServerConnection> {
   const transport = new StdioClientTransport({
     command,
     args,
     env: { ...process.env, ...env } as Record<string, string>,
   })
 
-  const client = new Client(
-    { name: 'gemini-mcp-real-server-test', version: '1.0.0' },
-    { capabilities: {} },
-  )
+  const client = new Client({ name: 'gemini-mcp-real-server-test', version: '1.0.0' }, { capabilities: {} })
 
   await client.connect(transport)
   return {
@@ -156,10 +141,7 @@ async function connectToServer(
 }
 
 async function getTools(client: Client) {
-  const response = await client.request(
-    { method: 'tools/list' },
-    ListToolsResultSchema,
-  )
+  const response = await client.request({ method: 'tools/list' }, ListToolsResultSchema)
   return response.tools || []
 }
 
@@ -184,53 +166,42 @@ describe('Real Server: @notionhq/notion-mcp-server', () => {
     }
   })
 
-  it(
-    'raw schemas are Gemini-incompatible, transforms fix them',
-    async () => {
-      // Connect with no token — tools/list works without auth
-      conn = await connectToServer('npx', [
-        '-y',
-        '@notionhq/notion-mcp-server',
-      ])
-      const tools = await getTools(conn.client)
+  it('raw schemas are Gemini-incompatible, transforms fix them', async () => {
+    // Connect with no token — tools/list works without auth
+    conn = await connectToServer('npx', ['-y', '@notionhq/notion-mcp-server'])
+    const tools = await getTools(conn.client)
 
-      expect(tools.length).toBeGreaterThan(0)
-      console.log(`  📡 Notion: ${tools.length} tools discovered`)
+    expect(tools.length).toBeGreaterThan(0)
+    console.log(`  📡 Notion: ${tools.length} tools discovered`)
 
-      // BASELINE: Count incompatible keys in raw schemas
-      let rawViolations = 0
-      const brokenTools: string[] = []
-      for (const tool of tools) {
-        const violations = findForbiddenKeys(tool.inputSchema)
-        rawViolations += violations.length
-        if (violations.length > 0) {
-          brokenTools.push(`${tool.name}(${violations.length})`)
-        }
+    // BASELINE: Count incompatible keys in raw schemas
+    let rawViolations = 0
+    const brokenTools: string[] = []
+    for (const tool of tools) {
+      const violations = findForbiddenKeys(tool.inputSchema)
+      rawViolations += violations.length
+      if (violations.length > 0) {
+        brokenTools.push(`${tool.name}(${violations.length})`)
       }
+    }
 
-      console.log(
-        `  ⚠️  Baseline: ${rawViolations} incompatible keys in ${brokenTools.length}/${tools.length} tools`,
-      )
-      if (brokenTools.length > 0) {
-        console.log(`     Broken: ${brokenTools.slice(0, 5).join(', ')}${brokenTools.length > 5 ? ` +${brokenTools.length - 5} more` : ''}`)
-      }
+    console.log(`  ⚠️  Baseline: ${rawViolations} incompatible keys in ${brokenTools.length}/${tools.length} tools`)
+    if (brokenTools.length > 0) {
+      console.log(`     Broken: ${brokenTools.slice(0, 5).join(', ')}${brokenTools.length > 5 ? ` +${brokenTools.length - 5} more` : ''}`)
+    }
 
-      // Raw schemas should have incompatibilities (otherwise why proxy?)
-      expect(rawViolations).toBeGreaterThan(0)
+    // Raw schemas should have incompatibilities (otherwise why proxy?)
+    expect(rawViolations).toBeGreaterThan(0)
 
-      // TRANSFORM: Run makeGeminiCompatible on each schema
-      let transformedViolations = 0
-      for (const tool of tools) {
-        const transformed = makeGeminiCompatible(tool.inputSchema as Record<string, any>)
-        assertGeminiCompatible(tool.name, transformed)
-      }
+    // TRANSFORM: Run makeGeminiCompatible on each schema
+    let transformedViolations = 0
+    for (const tool of tools) {
+      const transformed = makeGeminiCompatible(tool.inputSchema as Record<string, any>)
+      assertGeminiCompatible(tool.name, transformed)
+    }
 
-      console.log(
-        `  ✅ All ${tools.length} Notion tool schemas are Gemini-compatible after transform`,
-      )
-    },
-    120_000,
-  )
+    console.log(`  ✅ All ${tools.length} Notion tool schemas are Gemini-compatible after transform`)
+  }, 120_000)
 })
 
 describe('Real Server: awslabs.aws-api-mcp-server', () => {
@@ -248,11 +219,7 @@ describe('Real Server: awslabs.aws-api-mcp-server', () => {
     'raw schemas are Gemini-incompatible, transforms fix them',
     async () => {
       // AWS_REGION is required to start the server, but no credentials needed for tools/list
-      conn = await connectToServer(
-        'uvx',
-        ['awslabs.aws-api-mcp-server@latest'],
-        { AWS_REGION: 'us-east-1' },
-      )
+      conn = await connectToServer('uvx', ['awslabs.aws-api-mcp-server@latest'], { AWS_REGION: 'us-east-1' })
       const tools = await getTools(conn.client)
 
       expect(tools.length).toBeGreaterThan(0)
@@ -273,9 +240,7 @@ describe('Real Server: awslabs.aws-api-mcp-server', () => {
         }
       }
 
-      console.log(
-        `  ⚠️  Baseline: ${rawViolations} incompatible keys (has $ref/$defs: ${hasRefDefs})`,
-      )
+      console.log(`  ⚠️  Baseline: ${rawViolations} incompatible keys (has $ref/$defs: ${hasRefDefs})`)
       if (brokenTools.length > 0) {
         console.log(`     Broken: ${brokenTools.slice(0, 5).join(', ')}${brokenTools.length > 5 ? ` +${brokenTools.length - 5} more` : ''}`)
       }
@@ -288,9 +253,7 @@ describe('Real Server: awslabs.aws-api-mcp-server', () => {
         assertGeminiCompatible(tool.name, transformed)
       }
 
-      console.log(
-        `  ✅ All ${tools.length} AWS API tool schemas are Gemini-compatible after transform`,
-      )
+      console.log(`  ✅ All ${tools.length} AWS API tool schemas are Gemini-compatible after transform`)
     },
     180_000,
   )
