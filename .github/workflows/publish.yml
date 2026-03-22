@@ -34,6 +34,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     needs: test
+    environment: npm
 
     steps:
       - name: Checkout code
@@ -43,6 +44,7 @@ jobs:
         uses: wyvox/action-setup-pnpm@v3
         with:
           node-version: 22
+          node-registry-url: 'https://registry.npmjs.org'
 
       - name: Build
         run: pnpm build
@@ -52,10 +54,8 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           npm version "$VERSION" --no-git-tag-version
 
-      - name: Publish to npm
+      - name: Publish to npm (OIDC provenance)
         run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   preview:
     name: Preview (pkg-pr-new)
